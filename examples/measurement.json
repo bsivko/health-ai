@@ -1,0 +1,18 @@
+{
+  "id": "OBS-DEMO-weight-1",
+  "metric": "weight",
+  "observed_date": "2000-04-02",
+  "date_precision": "day",
+  "observed_time": null,
+  "timezone": null,
+  "value": 64.2,
+  "unit": "kg",
+  "conditions": null,
+  "method": null,
+  "recorded_date": "2000-04-04",
+  "source": {
+    "kind": "user_message",
+    "quote": "DEMO: 2 апреля 2000 года вес 64,2 кг. Полностью вымышленное сообщение."
+  },
+  "demo_only": true
+}

@@ -1,0 +1,9 @@
+# Keep synthetic fixture hashes stable across clones and operating systems.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary
+*.zip binary
+*.xlsx binary
+*.sqlite binary

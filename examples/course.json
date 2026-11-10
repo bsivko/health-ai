@@ -1,0 +1,20 @@
+{
+  "id": "COURSE-demo-only",
+  "product": {
+    "name": "DEMO-product — вымышленный",
+    "material_id": "MAT-c4a4dc23d2c8",
+    "material_card": "materials/2000-04-02/MAT-c4a4dc23d2c8.md"
+  },
+  "initial_reported_status": "active",
+  "regimen": {
+    "origin": "user_report",
+    "units_per_day": 1,
+    "unit": "условная единица",
+    "time_of_day": null,
+    "relation_to_meals": null
+  },
+  "planned_duration_days": 8,
+  "planned_total_units": 8,
+  "events_file": "records/medications/COURSE-demo-only-events.jsonl",
+  "demo_only": true
+}

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "material_types": {
+    "laboratory_result": "Лабораторные результаты",
+    "clinical_consultation": "Врачебное заключение",
+    "medical_record": "Медицинская учётная карта",
+    "product_information": "Сведения о препарате или добавке",
+    "instrumental_test": "Инструментальное исследование",
+    "health_data_export": "Выгрузка данных здоровья",
+    "unknown": "Неуточнённый вид",
+    "reference_information": "Справочная информация"
+  },
+  "domains": {
+    "cardiology": "Кардиология",
+    "endocrinology": "Эндокринология",
+    "immunology": "Иммунология",
+    "hematology": "Гематология",
+    "rheumatology": "Ревматология",
+    "nephrology": "Нефрология",
+    "physical_activity": "Физическая активность",
+    "sleep": "Сон",
+    "anthropometry": "Антропометрия",
+    "unknown": "Неуточнённая область",
+    "gastroenterology": "Гастроэнтерология",
+    "otorhinolaryngology": "Оториноларингология",
+    "neurology": "Неврология",
+    "phlebology": "Флебология",
+    "traumatology": "Травматология",
+    "urology": "Урология",
+    "ophthalmology": "Офтальмология",
+    "pulmonology": "Пульмонология",
+    "dermatology": "Дерматология",
+    "dentistry": "Стоматология"
+  },
+  "classification_fields": {
+    "material_type": "single code from material_types",
+    "subtype": "content-based subtype code",
+    "domains": "list of codes from domains",
+    "primary_domain": "one listed domain or null",
+    "basis": "content evidence, not diagnosis inference",
+    "status": "reviewed or needs_review",
+    "reviewed_date": "YYYY-MM-DD"
+  }
+}
