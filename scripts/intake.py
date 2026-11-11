@@ -244,21 +244,34 @@ def prepare(config_path, receipt_path):
         cards[path] += rep['metadata'] + '\n\n' + rep['body'] + '\n\n' + rep['equivalence_basis'] + '\n\nСтатус скана: ' + PENDING + '\n'
     require(bool(moves), 'Empty batch')
     check_moves(moves)
-    future = {materials.local(move['destination']) for move in moves}
-    future_cards = {materials.local(path) for path in cards}
-    for path, text in cards.items():
+    for text in cards.values():
         require('temp/' not in text and 'temp\\' not in text, 'Permanent card depends on temp')
-        for target in re.findall(r'\]\(([^)]+)\)', text):
-            if '://' in target or target.startswith('#'):
-                continue
-            resolved = materials.local(target.split('#')[0], materials.local(path).parent)
-            require(resolved.exists() or resolved in future or resolved in future_cards, 'Missing staged link: ' + target)
+    add_prepared_entries(manifest, entries, representations)
+    materials.verify(manifest, taxonomy, staged_cards={materials.local(path): text for path, text in cards.items()},
+                     staged_sources=staged_sources(moves))
+    materials.render_index(manifest, taxonomy)
     for path, text in cards.items():
         materials.local(path).write_text(text, encoding='utf-8')
     save(receipt_path, dict(schema_version=1, manifest_before_sha256=before_hash, entries=entries,
                             representations=representations, moves=moves,
                             cards={path: materials.digest(materials.local(path)) for path in cards}))
     print('OK: reviewed batch prepared; hashes, scopes and links checked. Originals remain in incoming.')
+
+
+def add_prepared_entries(manifest, entries, representations):
+    manifest['materials'].extend(entries)
+    for update in representations:
+        entry = next(e for e in manifest['materials'] if e['id'] == update['material_id'])
+        entry.setdefault('additional_representations', []).append(update['representation'])
+
+
+def staged_sources(moves):
+    sources = {}
+    for move in moves:
+        source = materials.local(move['source'])
+        destination = materials.local(move['destination'])
+        sources[destination] = source if source.is_file() else destination
+    return sources
 
 
 def accept(receipt_path):
@@ -282,6 +295,12 @@ def accept(receipt_path):
             text = text.replace(COMPLETED, PENDING)
         final_texts[path] = text.replace(PENDING, COMPLETED)
     check_moves(receipt['moves'], recover=True)
+    manifest, taxonomy = materials.load()
+    require(materials.digest(manifest_path) == current_hash, 'Manifest changed during acceptance')
+    if not published:
+        add_prepared_entries(manifest, receipt['entries'], receipt['representations'])
+    materials.verify(manifest, taxonomy, staged_sources=staged_sources(receipt['moves']))
+    index_text = materials.render_index(manifest, taxonomy)
     for move in receipt['moves']:
         src, dst = materials.local(move['source']), materials.local(move['destination'])
         if src.exists():
@@ -296,13 +315,6 @@ def accept(receipt_path):
             require(materials.digest(dst) == move['sha256'], 'Archive changed before source removal')
             src.unlink()
         require(materials.digest(dst) == move['sha256'], 'Archived source hash mismatch')
-    manifest, taxonomy = materials.load()
-    if not published:
-        manifest['materials'].extend(receipt['entries'])
-        for update in receipt['representations']:
-            entry = next(e for e in manifest['materials'] if e['id'] == update['material_id'])
-            entry.setdefault('additional_representations', []).append(update['representation'])
-    materials.verify(manifest, taxonomy)
     if not published:
         receipt['manifest_after_sha256'] = hashlib.sha256(serialized(manifest).encode('utf-8')).hexdigest()
         receipt['completed_cards'] = {path: hashlib.sha256(text.encode('utf-8')).hexdigest()
@@ -315,7 +327,7 @@ def accept(receipt_path):
         if materials.digest(materials.local(path)) != receipt['completed_cards'][path]:
             atomic_text(materials.local(path), text)
     index = materials.local('materials/INDEX.md')
-    atomic_text(index, materials.render_index(manifest, taxonomy))
+    atomic_text(index, index_text)
     materials.verify(manifest, taxonomy, inventory=True)
     materials.check_links(index)
     print('OK: batch archived without overwrites; hashes, cards, manifest and index verified.')

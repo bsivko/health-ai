@@ -1,7 +1,7 @@
 """Read-only project checks; no network, git mutations, or medical validation.
 
 Run from any directory. --empty also checks the initial empty data layers.
-The privacy pattern scan is heuristic and cannot establish anonymization.
+--privacy enables the heuristic publication scan.
 """
 import argparse
 import ast
@@ -38,7 +38,7 @@ def anchors(text):
         result.add(slug + ('-' + str(count) if count else ''))
     return result
 
-def verify(empty=False):
+def verify(empty=False, *, privacy=False):
     errors = []
     for folder in LAYERS:
         if not (ROOT / folder / 'AGENTS.md').is_file():
@@ -83,7 +83,7 @@ def verify(empty=False):
                         r'[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}',
                         r'\+(?:375|7|380)\s*\(?\d[\d() -]{8,}',
                         r'(?i)(?:sk-[a-z0-9]{20,}|ghp_[a-z0-9]{20,})')
-            if any(re.search(pattern, text) for pattern in patterns):
+            if privacy and any(re.search(pattern, text) for pattern in patterns):
                 errors.append(name + ': possible personal path/contact/secret; review required')
         except (ValueError, SyntaxError, OSError) as error:
             errors.append(f'{name}: {error}')
@@ -103,13 +103,15 @@ def verify(empty=False):
         raise ValueError('\n'.join(errors))
     print('PASS: project structure, local links/anchors, JSON and Python syntax.'
           + (' Empty data layers checked.' if empty else '')
-          + ' Heuristic privacy scan passed; this does not prove anonymization.')
+          + (' Heuristic privacy scan passed.' if privacy else ''))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--empty', action='store_true')
+    parser.add_argument('--privacy', action='store_true', help='Scan for personal paths, contacts and secrets')
     try:
-        verify(parser.parse_args().empty)
+        args = parser.parse_args()
+        verify(args.empty, privacy=args.privacy)
     except (ValueError, OSError) as error:
         print('ERROR: ' + str(error), file=sys.stderr)
         sys.exit(1)

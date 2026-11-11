@@ -54,16 +54,21 @@ def load():
     return manifest, taxonomy
 
 
-def check_links(path):
-    text = path.read_text(encoding='utf-8')
+def check_links(path, *, text=None, staged=()):
+    if text is None:
+        text = path.read_text(encoding='utf-8')
     for target in re.findall(r'\]\(([^)]+)\)', text):
         if '://' in target or target.startswith('#'):
             continue
         target_path = local(target.split('#')[0], path.parent)
-        require(target_path.exists(), f'Missing link in {path.relative_to(ROOT)}: {target}')
+        require(target_path.exists() or target_path in staged,
+                f'Missing link in {path.relative_to(ROOT)}: {target}')
 
 
-def verify(manifest, taxonomy, *, hashes=True, inventory=False):
+def verify(manifest, taxonomy, *, hashes=True, inventory=False, staged_cards=None, staged_sources=None):
+    staged_cards = staged_cards or {}
+    staged_sources = staged_sources or {}
+    staged_paths = staged_cards.keys() | staged_sources.keys()
     identifiers = set()
     paths = {}
     regions = {}
@@ -80,12 +85,12 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False):
         require(classification['primary_domain'] is None or classification['primary_domain'] in domains,
                 f'Primary domain absent from domains: {ident}')
         card = local(entry['card'])
-        require(card.is_file(), f'Missing card: {ident}')
-        text = card.read_text(encoding='utf-8')
+        require(card.is_file() or card in staged_cards, f'Missing card: {ident}')
+        text = staged_cards[card] if card in staged_cards else card.read_text(encoding='utf-8')
         if inventory:
             require(PENDING_INTAKE not in text, f'Unfinished intake publication: {ident}; resume its receipt')
         require(ident in text, f'Card ID mismatch: {ident}')
-        check_links(card)
+        check_links(card, text=text, staged=staged_paths)
         for derived in entry.get('derived_files', []):
             derived_path = local(derived['path'])
             require(derived_path.is_relative_to(local('materials')) and derived_path.is_file(),
@@ -95,7 +100,7 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False):
             if hashes:
                 require(digest(derived_path) == derived['sha256'], f'Derived file hash mismatch: {derived_path.name}')
             if derived_path.suffix.lower() == '.md':
-                check_links(derived_path)
+                check_links(derived_path, staged=staged_paths)
         sources = entry.get('originals') or [{'path': entry['original'], 'sha256': entry['sha256']}]
         if entry.get('source_regions'):
             source_names = {s['path'] for s in sources}
@@ -115,7 +120,7 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False):
             require(combined == entry['sha256'], f'Bundle hash mismatch: {ident}')
         for source in sources + entry.get('additional_representations', []):
             path = local(source['path'])
-            require(path.is_file(), f'Missing source: {source["path"]}')
+            require(staged_sources.get(path, path).is_file(), f'Missing source: {source["path"]}')
             require(path.is_relative_to(local('raw')),
                     f'Accepted source outside archive: {source["path"]}')
             require(re.fullmatch(r'[0-9a-f]{64}', source['sha256']) is not None, f'Invalid SHA-256: {path.name}')
@@ -144,7 +149,8 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False):
         paths[path] = receipt['sha256']
     if hashes:
         for path, expected in paths.items():
-            require(digest(path) == expected, f'Source hash mismatch: {path.relative_to(ROOT)}')
+            require(digest(staged_sources.get(path, path)) == expected,
+                    f'Source hash mismatch: {path.relative_to(ROOT)}')
     if inventory:
         for path in local('raw').rglob('*'):
             if path.is_file() and path.name != 'AGENTS.md':
@@ -152,6 +158,8 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False):
                         f'Unregistered archived file: {path.relative_to(ROOT)}; check unfinished intake receipts')
     for entry in manifest['materials']:
         for related in entry.get('related_materials', []):
+            require(isinstance(related, dict) and isinstance(related.get('id'), str),
+                    f'Invalid related_materials in {entry["id"]}: expected a material id in field "id"')
             require(related['id'] in identifiers, f'Missing related material: {related["id"]}')
 
 

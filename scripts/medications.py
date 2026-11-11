@@ -45,8 +45,9 @@ def check_events(course, events):
             value = event['reported_total_units']
             materials.require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
                               'Invalid cumulative unit count')
-            materials.require(event['last_intake_date'] <= event['effective_date'], 'Future intake date')
-            date.fromisoformat(event['last_intake_date'])
+            last_intake_date = event.get('last_intake_date')
+            if last_intake_date is not None:
+                materials.require(date.fromisoformat(last_intake_date) <= when, 'Future intake date')
             correction = event.get('corrects_event_id')
             if correction:
                 materials.require(correction in ids and ids[correction]['type'] == 'checkpoint',
@@ -136,8 +137,9 @@ def state(course, events, as_of):
         out.update(reported_total_units=count,
                    remaining_units_at_checkpoint=max(0, target - count) if target is not None else None)
         # A calendar projection is never an intake event or a completion status.
-        if status == 'active' and not changed and dose == 1 and target is not None and count > 0 and count <= target:
-            last = date.fromisoformat(checkpoint['last_intake_date'])
+        last_intake_date = checkpoint.get('last_intake_date')
+        if last_intake_date and status == 'active' and not changed and dose == 1 and target is not None and 0 < count <= target:
+            last = date.fromisoformat(last_intake_date)
             out['projection'] = dict(start_date=(last - timedelta(days=count - 1)).isoformat(),
                                      last_day=(last + timedelta(days=target - count)).isoformat(),
                                      basis='conditional_daily_one_unit_without_missed_days',
@@ -145,7 +147,7 @@ def state(course, events, as_of):
     return out
 
 
-def user_reports():
+def user_reports(as_of=None):
     manifest, _ = materials.load()
     known = {e['id'] for e in manifest['materials']}
     reports = []
@@ -157,7 +159,8 @@ def user_reports():
         key = 'prescription' if report.get('prescription_material_id') else 'product'
         materials.require(report[key + '_material_id'] in known, 'Unknown report source')
         materials.require(materials.local(report[key + '_card']).is_file(), 'Missing report source card')
-        reports.append((path, report))
+        if as_of is None or report['recorded_date'] <= as_of:
+            reports.append((path, report))
     return reports
 
 
@@ -217,6 +220,8 @@ def render(courses, as_of):
         if checkpoint:
             lines += ['- Последнее подтверждение: **' + str(current['reported_total_units']) +
                       ' ед. принято**, состояние на **' + checkpoint['effective_date'] + '**.']
+            if checkpoint.get('last_intake_date') is None:
+                lines += ['- Дата последнего приёма неизвестна.']
             if current['remaining_units_at_checkpoint'] is not None:
                 lines += ['- По этому подтверждению остаётся **' + str(current['remaining_units_at_checkpoint']) +
                           ' ед.** до исходной цели. Это не подтверждённый остаток упаковки сегодня.']
@@ -233,7 +238,7 @@ def render(courses, as_of):
                       '**. Обе даты расчётные, не подтверждённая история.']
         lines += ['', 'Новые приёмы, пропуски и завершение автоматически не проставляются. '
                   'Сведения о пропусках и назначившем этот конкретный продукт враче не дополнены догадками.', '']
-    reports = [(path, report) for path, report in user_reports() if report['recorded_date'] <= as_of]
+    reports = user_reports(as_of)
     if reports:
         lines += ['## Дополнительные сообщения о назначениях и планах приёма', '']
         for path, report in reports:
@@ -253,6 +258,8 @@ def main():
     for name in ['status', 'render']:
         p = commands.add_parser(name)
         p.add_argument('--as-of', required=True)
+        if name == 'status':
+            p.add_argument('--courses-only', action='store_true', help='Return only course states')
     p = commands.add_parser('add-event')
     p.add_argument('course_id')
     p.add_argument('event_json', type=Path)
@@ -262,7 +269,13 @@ def main():
         user_reports()
         print('OK: course definitions, product sources and event histories verified.')
     elif args.command == 'status':
-        print(json.dumps([state(c, e, args.as_of) for c, e in courses], ensure_ascii=False, indent=2))
+        date.fromisoformat(args.as_of)
+        rows = [state(c, e, args.as_of) for c, e in courses]
+        if not args.courses_only:
+            rows.extend(dict(kind='user_report', as_of=args.as_of,
+                             path=path.relative_to(materials.ROOT).as_posix(), report=report)
+                        for path, report in user_reports(args.as_of))
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
     elif args.command == 'render':
         output = FOLDER / 'CURRENT.md'
         output.write_text(render(courses, args.as_of), encoding='utf-8')

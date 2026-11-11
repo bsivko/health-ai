@@ -73,7 +73,18 @@ def check_medications(folder):
     medications.check_events(course, [recent, historical])
     assert medications.state(course, [recent, historical], '2000-04-07')['reported_total_units'] == 5
     assert medications.state(course, events + [corrected], '2000-04-04')['reported_total_units'] == 2
-    run(folder, 'medications.py', 'render', '--as-of', '2000-04-04')
+    aggregate = dict(events[0], id='EVENT-aggregate', effective_date='2000-04-06',
+                     recorded_date='2000-04-06', reported_total_units=4, last_intake_date=None,
+                     source=dict(kind='user_message', quote='Принял всего 4 единицы.'))
+    save(folder / 'temp/aggregate.json', aggregate)
+    run(folder, 'medications.py', 'add-event', course['id'], 'temp/aggregate.json')
+    run(folder, 'medications.py', 'verify')
+    for as_of in ('2000-04-06', '2001-04-04'):
+        row = json.loads(run(folder, 'medications.py', 'status', '--as-of', as_of))[0]
+        assert row['reported_total_units'] == 4 and row['checkpoint']['last_intake_date'] is None
+        assert row['projection'] is None
+    run(folder, 'medications.py', 'render', '--as-of', '2000-04-06')
+    assert 'Дата последнего приёма неизвестна' in (folder / 'records/medications/CURRENT.md').read_text(encoding='utf-8')
 
 def main():
     if sys.flags.optimize:
@@ -112,12 +123,23 @@ def main():
         shutil.copyfile(ROOT / 'examples/reviewed-intake.json', config)
         run(folder, 'materials.py', 'index')
         run(folder, 'materials.py', 'verify')
+        bad_config = json.loads(config.read_text(encoding='utf-8'))
+        bad_relation = {'material_id': 'MAT-unknown'}
+        bad_config['documents'][0].setdefault('registry_extra', {})['related_materials'] = [bad_relation]
+        save(folder / 'temp/invalid.json', bad_config)
+        run(folder, 'intake.py', 'prepare', 'temp/invalid.json', 'temp/invalid-receipt.json', ok=False)
+        assert not list((folder / 'materials').rglob('MAT-*.md'))
         run(folder, 'intake.py', 'prepare', config, 'temp/receipt.json')
         assert (folder / 'incoming/demo-lab.txt').is_file()
         receipt = json.loads((folder / 'temp/receipt.json').read_text(encoding='utf-8'))
         source = folder / receipt['moves'][0]['source']
         dest = folder / receipt['moves'][0]['destination']
         original_bytes = source.read_bytes()
+        receipt['entries'][0]['related_materials'] = [bad_relation]
+        save(folder / 'temp/invalid-receipt.json', receipt)
+        run(folder, 'intake.py', 'accept', 'temp/invalid-receipt.json', ok=False)
+        assert source.read_bytes() == original_bytes and not dest.exists()
+        assert all((folder / move['source']).is_file() for move in receipt['moves'])
         source.write_bytes(original_bytes + b'changed')
         run(folder, 'intake.py', 'accept', 'temp/receipt.json', ok=False)
         assert source.is_file() and not dest.exists()
