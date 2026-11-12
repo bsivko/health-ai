@@ -4,6 +4,7 @@ preview INPUT_DIR OUTPUT_DIR --prefix PREFIX writes temporary thumbnails plus
 PREFIX-inputs.json. orient CONFIG_JSON writes full-size PNGs and a manifest;
 config contains output_dir, manifest_name and images with source, source_sha256,
 archived_source, rotation_degrees (0/90/180/270 counterclockwise), view_name.
+The archived source must already exist under raw and match the input SHA-256.
 Neither operation changes originals. Read applicable AGENTS before invoking.
 inspect INPUT OUTPUT --rotation 180 --contrast 4 --autocontrast-cutoff 1
 creates a temporary readability preview and a transformation receipt, not evidence
@@ -14,7 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance
 
 import materials
 
@@ -48,31 +49,45 @@ def preview(input_dir, output_dir, prefix, pattern='*'):
 def orient(config):
     folder = materials.local(config['output_dir'])
     materials.require(folder.is_dir() and (folder / 'AGENTS.md').is_file(), 'Read/create output AGENTS first')
-    records = []
+    manifest = (folder / config.get('manifest_name', 'images.json')).resolve()
+    materials.require(manifest.parent == folder and not manifest.exists(), 'Invalid/existing image manifest')
+    jobs = []
+    targets = {manifest}
+    archive = materials.local('raw')
     for item in config['images']:
         source = materials.local(item['source'])
+        archived = materials.local(item['archived_source'])
         materials.require(materials.digest(source) == item['source_sha256'], 'Source changed')
+        materials.require(archived.is_relative_to(archive) and archived.is_file(), 'Archived image source missing/outside raw')
+        materials.require(materials.digest(archived) == item['source_sha256'], 'Archived image differs from input')
         name = item['view_name']
         materials.require(Path(name).name == name and name.lower().endswith('.png'), 'Invalid view filename')
-        target = folder / name
-        materials.require(not target.exists(), 'View already exists')
+        target = (folder / name).resolve()
+        materials.require(target.parent == folder and target not in targets and not target.exists(), 'Invalid/existing view path')
+        targets.add(target)
         rotation = item['rotation_degrees']
-        transpose = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_270}
         materials.require(rotation in (0, 90, 180, 270), 'Unsupported rotation')
+        jobs.append((source, archived, target, rotation, item['source_sha256']))
+    records = []
+    transpose = {90: Image.Transpose.ROTATE_90, 180: Image.Transpose.ROTATE_180, 270: Image.Transpose.ROTATE_270}
+    for source, archived, target, rotation, expected_hash in jobs:
         with Image.open(source) as original:
             expected = original.copy() if rotation == 0 else original.transpose(transpose[rotation])
-            expected.save(target)
+            with target.open('xb') as output:
+                expected.save(output, format='PNG')
             with Image.open(target) as reopened:
                 materials.require(reopened.mode == expected.mode and reopened.size == expected.size,
                                   'View mode/size mismatch')
-                materials.require(ImageChops.difference(reopened, expected).getbbox() is None, 'Pixel mismatch')
-        records.append(dict(source_path=item['archived_source'], source_sha256=item['source_sha256'],
+                materials.require(reopened.tobytes() == expected.tobytes() and
+                                  reopened.convert('RGBA').tobytes() == expected.convert('RGBA').tobytes(), 'Pixel mismatch')
+        materials.require(materials.digest(source) == materials.digest(archived) == expected_hash, 'Image source changed during orientation')
+        records.append(dict(source_path=archived.relative_to(materials.ROOT).as_posix(), source_sha256=expected_hash,
                             view_path=target.relative_to(materials.ROOT).as_posix(),
                             view_sha256=materials.digest(target), rotation_degrees=rotation,
                             resize=False, crop=False, pixel_check='identical_to_decoded_original_with_documented_rotation'))
-    manifest = folder / config.get('manifest_name', 'images.json')
-    materials.require(manifest.parent == folder and not manifest.exists(), 'Invalid/existing image manifest')
-    save(manifest, dict(schema_version=1, images=records))
+    with manifest.open('x', encoding='utf-8') as output:
+        json.dump(dict(schema_version=1, images=records), output, ensure_ascii=False, indent=2)
+        output.write('\n')
     print('OK: full-size orientation copies verified pixel-for-pixel; source files unchanged.')
 
 

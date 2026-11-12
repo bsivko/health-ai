@@ -5,9 +5,13 @@ import json
 from pathlib import Path
 import re
 import sys
+from urllib.parse import quote, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 PENDING_INTAKE = 'содержание проверено; перенос ожидается.'
+STATUS_MARKER = ' <!-- intake-status -->'
+FENCED = re.compile(r'(?ms)^ {0,3}(`{3,}|~{3,})[^\n]*\n.*?^(?: {0,3}\1[`~]*[ \t]*$|\Z)')
+INLINE_LINK = re.compile(r'\]\((?:<([^>\n]+)>|((?:[^()\n]|\((?:[^()\n]|\([^()\n]*\))*\))*))\)')
 
 
 def local(path, parent=ROOT):
@@ -54,15 +58,40 @@ def load():
     return manifest, taxonomy
 
 
+def markdown_prose(text):
+    return FENCED.sub('', text.replace('\r\n', '\n').replace('\r', '\n'))
+
+
+def markdown_links(text):
+    for match in INLINE_LINK.finditer(markdown_prose(text)):
+        yield match.group(1) or match.group(2)
+
+
+def link_target(target):
+    url = urlsplit(target)
+    if not url.scheme and not url.netloc:
+        return unquote(url.path), unquote(url.fragment)
+    return None
+
+
+def markdown_link(label, target):
+    label = str(label).replace('\\', '\\\\').replace('[', '\\[').replace(']', '\\]')
+    return f'[{label}]({quote(target)})'
+
+
 def check_links(path, *, text=None, staged=()):
     if text is None:
         text = path.read_text(encoding='utf-8')
-    for target in re.findall(r'\]\(([^)]+)\)', text):
-        if '://' in target or target.startswith('#'):
+    links = set()
+    for target in markdown_links(text):
+        location = link_target(target)
+        if not location or not location[0]:
             continue
-        target_path = local(target.split('#')[0], path.parent)
+        target_path = local(location[0], path.parent)
         require(target_path.exists() or target_path in staged,
-                f'Missing link in {path.relative_to(ROOT)}: {target}')
+                f'Missing link in {path.relative_to(ROOT).as_posix()}: {target}')
+        links.add(target_path)
+    return links
 
 
 def verify(manifest, taxonomy, *, hashes=True, inventory=False, staged_cards=None, staged_sources=None):
@@ -71,7 +100,15 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False, staged_cards=Non
     staged_paths = staged_cards.keys() | staged_sources.keys()
     identifiers = set()
     paths = {}
+    source_paths_by_hash = {}
+    cards = set()
+    derived_paths = set()
     regions = {}
+    duplicates_by_material = {}
+    for receipt in manifest.get('duplicate_receipts', []):
+        duplicates_by_material.setdefault(receipt['canonical_id'], set()).add(local(receipt['archived_copy']))
+    archive = local('raw')
+    materials_dir = local('materials')
     for entry in manifest['materials']:
         ident = entry['id']
         require(ident not in identifiers, f'Duplicate material ID: {ident}')
@@ -85,16 +122,34 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False, staged_cards=Non
         require(classification['primary_domain'] is None or classification['primary_domain'] in domains,
                 f'Primary domain absent from domains: {ident}')
         card = local(entry['card'])
+        prefix = 'MAT-' + entry['sha256'][:12]
+        expected_id = re.escape(prefix) + (r'-[a-z][a-z0-9-]*' if entry.get('source_regions') else '')
+        require(re.fullmatch(r'[0-9a-f]{64}', entry['sha256']) and re.fullmatch(expected_id, ident),
+                f'ID does not match source hash/scope: {ident}')
+        require(card.parent.parent == materials_dir and card.name == ident + '.md',
+                f'Card path does not match material ID: {ident}')
+        cards.add(card)
         require(card.is_file() or card in staged_cards, f'Missing card: {ident}')
         text = staged_cards[card] if card in staged_cards else card.read_text(encoding='utf-8')
-        if inventory:
-            require(PENDING_INTAKE not in text, f'Unfinished intake publication: {ident}; resume its receipt')
+        if inventory and card not in staged_cards:
+            prose = markdown_prose(text)
+            status = re.escape(PENDING_INTAKE)
+            pending = (re.search(r'^(?:- Статус|Статус скана): ' + status + re.escape(STATUS_MARKER) + r'$', prose, re.M) or
+                       re.search(r'^- Статус: ' + status + r'$', prose.split('\n## Источники', 1)[0], re.M) or
+                       (entry.get('additional_representations') and
+                        prose.rstrip().endswith('Статус скана: ' + PENDING_INTAKE)))
+            require(not pending, f'Unfinished intake publication: {ident}; resume its receipt')
         require(ident in text, f'Card ID mismatch: {ident}')
-        check_links(card, text=text, staged=staged_paths)
+        links = check_links(card, text=text, staged=staged_paths)
+        # Earlier records may link a retained scan transcription directly.
+        scan_transcript = card.with_name(ident + '-scan-v2.md')
+        if scan_transcript in links:
+            derived_paths.add(scan_transcript)
         for derived in entry.get('derived_files', []):
             derived_path = local(derived['path'])
             require(derived_path.is_relative_to(local('materials')) and derived_path.is_file(),
                     f'Missing/outside derived file: {ident}')
+            derived_paths.add(derived_path)
             require(re.fullmatch(r'[0-9a-f]{64}', derived['sha256']) is not None,
                     f'Invalid derived SHA-256: {ident}')
             if hashes:
@@ -102,38 +157,51 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False, staged_cards=Non
             if derived_path.suffix.lower() == '.md':
                 check_links(derived_path, staged=staged_paths)
         sources = entry.get('originals') or [{'path': entry['original'], 'sha256': entry['sha256']}]
+        source_boxes = {}
         if entry.get('source_regions'):
             source_names = {s['path'] for s in sources}
             require(len(entry['source_regions']) == len(sources), f'Incomplete source regions: {ident}')
             require({r['path'] for r in entry['source_regions']} == source_names, f'Region/source mismatch: {ident}')
             for region in entry['source_regions']:
                 box = region_bounds(region)
-                previous = regions.setdefault(region['path'], [])
-                require(not any(regions_overlap(box, old) for old in previous),
-                        f'Overlapping document regions: {ident}')
-                previous.append(box)
+                source_boxes[local(region['path'])] = box
         scope = entry.get('sha256_scope')
         require(scope in (None, 'ordered_original_sha256_bytes'), f'Unknown hash scope: {ident}')
         if scope == 'ordered_original_sha256_bytes':
             require([s['order'] for s in sources] == list(range(1, len(sources) + 1)), f'Invalid source order: {ident}')
             combined = hashlib.sha256(b''.join(bytes.fromhex(s['sha256']) for s in sources)).hexdigest()
             require(combined == entry['sha256'], f'Bundle hash mismatch: {ident}')
-        for source in sources + entry.get('additional_representations', []):
+        else:
+            require(len(sources) == 1 and sources[0]['sha256'] == entry['sha256'], f'Original hash mismatch: {ident}')
+        representations = entry.get('additional_representations', [])
+        accepted_paths = {local(source['path']): source['sha256'] for source in sources + representations}
+        raw_links = {p for p in links if p.is_relative_to(archive)}
+        require(accepted_paths.keys() <= raw_links <= accepted_paths.keys() | duplicates_by_material.get(ident, set()),
+                f'Card archive links differ from registered sources: {ident}')
+        for source in sources + representations:
             path = local(source['path'])
             require(staged_sources.get(path, path).is_file(), f'Missing source: {source["path"]}')
-            require(path.is_relative_to(local('raw')),
+            require(path.is_relative_to(archive),
                     f'Accepted source outside archive: {source["path"]}')
             require(re.fullmatch(r'[0-9a-f]{64}', source['sha256']) is not None, f'Invalid SHA-256: {path.name}')
             require(path not in paths or paths[path] == source['sha256'], f'Conflicting source hash: {path.name}')
             paths[path] = source['sha256']
+            previous_path = source_paths_by_hash.setdefault(source['sha256'], path)
+            require(path == previous_path, f'Same source bytes registered at different paths: {ident}')
+            box = source_boxes.get(path) if source in sources else None
+            previous = regions.setdefault(path, [])
+            require(all(box is not None and old is not None and not regions_overlap(box, old) for old in previous),
+                    f'Repeated source or overlapping document regions: {ident}')
+            previous.append(box)
         if entry.get('laboratory_data'):
             data_path = local(entry['laboratory_data'])
             require(data_path.is_file(), f'Missing laboratory data: {ident}')
             require(digest(data_path) == entry['laboratory_data_sha256'], f'Laboratory data hash mismatch: {ident}')
             data = json.loads(data_path.read_text(encoding='utf-8'))
             require(data['material_id'] == ident, f'Laboratory data ID mismatch: {ident}')
-            require(local(data['source']['path']) in paths, f'Unregistered laboratory source: {ident}')
-            require(paths[local(data['source']['path'])] == data['source']['sha256'], f'Laboratory source hash mismatch: {ident}')
+            data_source = local(data['source']['path'])
+            require(data_source in accepted_paths, f'Unregistered laboratory source: {ident}')
+            require(accepted_paths[data_source] == data['source']['sha256'], f'Laboratory source hash mismatch: {ident}')
             require(len(data['analytes']) == entry['result_count'], f'Laboratory result count mismatch: {ident}')
             keys = [row['event_key'] for row in data['analytes']]
             require(len(keys) == len(set(keys)), f'Repeated analyte group: {ident}')
@@ -146,6 +214,7 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False, staged_cards=Non
         require(receipt['sha256'] == canonical['sha256'], 'Duplicate receipt hash differs from canonical')
         path = local(receipt['archived_copy'])
         require(path.is_file() and path.is_relative_to(local('raw')), 'Missing archived duplicate')
+        require(path not in paths, 'Duplicate receipt must refer to a separate archived copy')
         paths[path] = receipt['sha256']
     if hashes:
         for path, expected in paths.items():
@@ -156,6 +225,11 @@ def verify(manifest, taxonomy, *, hashes=True, inventory=False, staged_cards=Non
             if path.is_file() and path.name != 'AGENTS.md':
                 require(path.resolve() in paths,
                         f'Unregistered archived file: {path.relative_to(ROOT)}; check unfinished intake receipts')
+        for path in materials_dir.glob('*/MAT-*.md'):
+            if re.fullmatch(r'MAT-[0-9a-f]{12}(?:-[a-z][a-z0-9-]*)?\.md', path.name):
+                resolved = path.resolve()
+                require(resolved in cards or resolved in derived_paths,
+                        f'Unregistered material card: {path.relative_to(ROOT)}; check unfinished intake receipts')
     for entry in manifest['materials']:
         for related in entry.get('related_materials', []):
             require(isinstance(related, dict) and isinstance(related.get('id'), str),
@@ -168,7 +242,7 @@ def date(entry):
 
 
 def link(entry):
-    return f'[{entry["title"]}]({Path(entry["card"]).relative_to("materials").as_posix()})'
+    return markdown_link(entry['title'], Path(entry['card']).relative_to('materials').as_posix())
 
 
 def render_index(manifest, taxonomy):
@@ -217,9 +291,9 @@ def main():
     index_path = local('materials/INDEX.md')
     if args.command == 'index':
         text = render_index(manifest, taxonomy)
+        check_links(index_path, text=text)
         if index_path.read_text(encoding='utf-8') != text:
             index_path.write_text(text, encoding='utf-8')
-        check_links(index_path)
         print('OK: index by material type, domain and date updated; sources and registry unchanged.')
     else:
         check_links(index_path)

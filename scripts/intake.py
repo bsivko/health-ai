@@ -66,13 +66,37 @@ def require(ok, message):
     materials.require(ok, message)
 
 
-def normalize(value):
-    return re.sub(r'[^а-яa-z0-9<>.]', '', value.lower().replace('t3', 'т3'))
+def name_key(value):
+    return ' '.join(value.casefold().split())
+
+
+def field_key(value, field):
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    if field == 'result' and re.fullmatch(r'[+-]?[0-9]+,[0-9]+', value):
+        return value.replace(',', '.')
+    return value
+
+
+def calendar_date(value):
+    require(date.fromisoformat(value).isoformat() == value, 'Expected a date in YYYY-MM-DD form')
+
+
+def text_hash(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def finish_card(text, positions):
+    for position in reversed(positions):
+        require(text[position:position + len(PENDING)] == PENDING, 'Missing generated intake status')
+        text = text[:position] + COMPLETED + text[position + len(PENDING):]
+    return text
 
 
 def source(name, expected, event_date):
     if event_date != 'undated':
-        date.fromisoformat(event_date)
+        calendar_date(event_date)
     require(Path(name).name == name and '/' not in name and '\\' not in name, 'Invalid input filename')
     require(re.fullmatch('[0-9a-f]{64}', expected) is not None, 'Invalid input SHA-256')
     src = materials.local('incoming/' + name)
@@ -89,17 +113,20 @@ def source(name, expected, event_date):
 def check_moves(moves, recover=False):
     destinations = set()
     sources = set()
+    hashes = set()
     for move in moves:
         src, dst = materials.local(move['source']), materials.local(move['destination'])
         require(src.parent == materials.local('incoming'), 'Source outside inbox')
         require(dst.parent.parent == materials.local('raw'), 'Destination outside dated archive')
         if dst.parent.name != 'undated':
-            date.fromisoformat(dst.parent.name)
+            calendar_date(dst.parent.name)
         collision_name = src.stem + '__' + move['sha256'][:12] + src.suffix
         require(dst.name in (src.name, collision_name), 'Unexpected archive filename')
         require(dst not in destinations and src not in sources, 'Repeated move')
+        require(move['sha256'] not in hashes, 'Same source bytes submitted under different filenames')
         destinations.add(dst)
         sources.add(src)
+        hashes.add(move['sha256'])
         if recover and dst.is_file():
             require(materials.digest(dst) == move['sha256'], 'Moved source hash mismatch')
             if src.exists():
@@ -113,10 +140,13 @@ def prepare(config_path, receipt_path):
     config = read(config_path)
     require(config.get('reviewed') is True, 'Medical content must be reviewed first')
     require(not receipt_path.exists(), 'Receipt already exists')
+    require(receipt_path.parent.is_dir(), 'Receipt directory does not exist')
+    calendar_date(config['registered_date'])
     manifest_path = materials.local('materials/manifest.json')
     manifest, taxonomy = materials.load()
     before_hash = materials.digest(manifest_path)
     cards, entries, representations, moves = {}, [], [], []
+    cards_before, statuses = {}, {}
     ids = {entry['id'] for entry in manifest['materials']}
     shared_sources = {}
     known = {s['sha256'] for e in manifest['materials'] for s in
@@ -125,6 +155,15 @@ def prepare(config_path, receipt_path):
         if doc['date'] == 'undated':
             require(doc['type'] == 'reference_information' and doc.get('event_date', '') is None,
                     'Undated intake currently supports only explicitly undated reference information')
+        else:
+            calendar_date(doc['date'])
+        event_date = doc.get('event_date', doc['date'])
+        if event_date is not None:
+            calendar_date(event_date)
+            if doc['type'] == 'laboratory_result':
+                require(doc['date'] == event_date, 'Laboratory card date must match the known sampling date')
+        else:
+            require(bool(doc.get('registry_extra', {}).get('catalog_date_basis')), 'Unknown event date requires explicit catalogue basis')
         originals = []
         scope_key = doc.get('scope_key')
         regions = doc.get('source_regions', [])
@@ -141,6 +180,8 @@ def prepare(config_path, receipt_path):
             require(materials.local('materials/' + doc['date'] + '/AGENTS.md').is_file(), 'Read/create card date AGENTS first')
             archive = item.get('archive_date', doc.get('archive_date', doc['date']))
             require(archive != 'undated' or doc['date'] == 'undated', 'Undated carrier requires an undated reference card')
+            if doc['type'] == 'laboratory_result' and event_date is not None and not scope_key:
+                require(archive == event_date, 'Laboratory archive date must match sampling date for an unshared original')
             move = source(item['name'], item['sha256'], archive)
             region = next((materials.region_bounds(r) for r in regions if r['name'] == item['name']), None)
             previous = shared_sources.get(item['name'])
@@ -168,11 +209,7 @@ def prepare(config_path, receipt_path):
         require(doc['primary'] is None or doc['primary'] in doc['domains'], 'Invalid primary domain')
         card_path = 'materials/' + doc['date'] + '/' + ident + '.md'
         require(not materials.local(card_path).exists(), 'Card already exists')
-        event_date = doc.get('event_date', doc['date'])
-        if event_date is not None:
-            date.fromisoformat(event_date)
-        else:
-            require(bool(doc.get('registry_extra', {}).get('catalog_date_basis')), 'Unknown event date requires explicit catalogue basis')
+        cards_before[card_path] = None
         entry = dict(id=ident, sha256=sha, card=card_path, title=doc['title'], event_date=event_date,
                      registered_date=config['registered_date'], status='completed', representation_version=2,
                      classification=classification, recognition_method='reviewed_source_transcription')
@@ -188,7 +225,7 @@ def prepare(config_path, receipt_path):
         else:
             entry.update(originals=originals, sha256_scope='ordered_original_sha256_bytes',
                          grouping_basis=doc['grouping_basis'])
-        if event_date is None:
+        if event_date != doc['date']:
             entry['catalog_date'] = None if doc['date'] == 'undated' else doc['date']
             if doc['date'] == 'undated':
                 entry['catalog_location'] = 'undated'
@@ -204,10 +241,13 @@ def prepare(config_path, receipt_path):
         text += '- Вид: **' + taxonomy['material_types'][doc['type']] + '** (`' + doc['type'] + '`); подвид: `' + doc['subtype'] + '`.\n'
         text += '- Области: ' + ', '.join(taxonomy['domains'][d] for d in doc['domains']) + '.\n'
         text += '- Основная область: ' + (taxonomy['domains'][doc['primary']] if doc['primary'] else 'не выделена — смешанное содержание') + '.\n'
-        text += '- Основание: ' + doc['basis'] + '\n- Метки проверены по содержимому; не устанавливают диагноз.\n- Статус: ' + PENDING + '\n\n'
+        text += '- Основание: ' + doc['basis'] + '\n- Метки проверены по содержимому; не устанавливают диагноз.\n- Статус: '
+        statuses[card_path] = [len(text)]
+        text += PENDING + materials.STATUS_MARKER + '\n\n'
         text += doc['metadata'] + '\n\n## Источники\n\n'
         for original in originals:
-            text += '- Источник ' + str(original['order']) + ': [' + Path(original['path']).name + '](../../' + original['path'] + '); SHA-256 `' + original['sha256'] + '`.\n'
+            link = materials.markdown_link(Path(original['path']).name, '../../' + original['path'])
+            text += '- Источник ' + str(original['order']) + ': ' + link + '; SHA-256 `' + original['sha256'] + '`.\n'
         if scope_key:
             text += '\nОбласть этого документа: ' + '; '.join(r['name'] + ' — ' +
                     (('прямоугольник ' + str(r['bounds']) + ' в координатах исходного скана (0–1)')
@@ -219,16 +259,17 @@ def prepare(config_path, receipt_path):
         entries.append(entry)
     for rep in config.get('representations', []):
         entry = next(e for e in manifest['materials'] if e['id'] == rep['material_id'])
-        require(rep['date'] == entry['event_date'], 'Representation date differs from canonical event')
+        require(rep['date'] == Path(entry['card']).parent.name, 'Representation date differs from canonical card catalogue')
         require(rep['sha256'] not in known, 'Exact duplicate needs duplicate-receipt handling')
         move = source(rep['file'], rep['sha256'], rep['date'])
         moves.append(move)
         if rep.get('checks'):
             data = read(materials.local(entry['laboratory_data']))
             for check in rep['checks']:
-                group = next(g for g in data['analytes'] if normalize(g['name']) == normalize(check['name']))
-                require(any(all(normalize(v[k]) == normalize(check[k]) for k in ['result', 'unit', 'reference', 'flag'])
-                            for v in group['variants']), 'Scan differs from canonical table: ' + check['name'])
+                groups = [g for g in data['analytes'] if name_key(g['name']) == name_key(check['name'])]
+                require(len(groups) == 1, 'Unknown or ambiguous canonical analyte: ' + check['name'])
+                require(any(all(field_key(v[k], k) == field_key(check[k], k) for k in ('result', 'unit', 'reference', 'flag'))
+                            for v in groups[0]['variants']), 'Scan differs from canonical table: ' + check['name'])
         descriptor = dict(path=move['destination'], sha256=rep['sha256'], kind='printed_scan',
                           received_filename=rep['file'],
                           registered_date=config['registered_date'], status='completed',
@@ -238,23 +279,28 @@ def prepare(config_path, receipt_path):
         representations.append(dict(material_id=rep['material_id'], representation=descriptor))
         path = entry['card']
         if path not in cards:
-            cards[path] = materials.local(path).read_text(encoding='utf-8')
+            original = materials.local(path).read_bytes()
+            cards[path] = original.decode('utf-8')
+            cards_before[path] = hashlib.sha256(original).hexdigest()
+            statuses[path] = []
         cards[path] += '\n## Дополнительное представление: ' + rep['file'] + '\n\n'
-        cards[path] += '[Скан](../../' + move['destination'] + '); SHA-256 `' + rep['sha256'] + '`.\n\n'
-        cards[path] += rep['metadata'] + '\n\n' + rep['body'] + '\n\n' + rep['equivalence_basis'] + '\n\nСтатус скана: ' + PENDING + '\n'
+        cards[path] += materials.markdown_link('Скан', '../../' + move['destination']) + '; SHA-256 `' + rep['sha256'] + '`.\n\n'
+        cards[path] += rep['metadata'] + '\n\n' + rep['body'] + '\n\n' + rep['equivalence_basis'] + '\n\nСтатус скана: '
+        statuses[path].append(len(cards[path]))
+        cards[path] += PENDING + materials.STATUS_MARKER + '\n'
     require(bool(moves), 'Empty batch')
     check_moves(moves)
     for text in cards.values():
         require('temp/' not in text and 'temp\\' not in text, 'Permanent card depends on temp')
     add_prepared_entries(manifest, entries, representations)
-    materials.verify(manifest, taxonomy, staged_cards={materials.local(path): text for path, text in cards.items()},
-                     staged_sources=staged_sources(moves))
-    materials.render_index(manifest, taxonomy)
-    for path, text in cards.items():
-        materials.local(path).write_text(text, encoding='utf-8')
-    save(receipt_path, dict(schema_version=1, manifest_before_sha256=before_hash, entries=entries,
-                            representations=representations, moves=moves,
-                            cards={path: materials.digest(materials.local(path)) for path in cards}))
+    verify_publication(manifest, taxonomy, cards, moves)
+    receipt = dict(schema_version=2, manifest_before_sha256=before_hash, entries=entries,
+                   representations=representations, moves=moves, cards_before=cards_before,
+                   prepared_cards=cards, status_positions=statuses,
+                   cards={path: text_hash(text) for path, text in cards.items()})
+    require(materials.digest(manifest_path) == before_hash, 'Manifest changed during preparation')
+    save(receipt_path, receipt)
+    stage_cards(receipt, published=False, write=True)
     print('OK: reviewed batch prepared; hashes, scopes and links checked. Originals remain in incoming.')
 
 
@@ -274,33 +320,94 @@ def staged_sources(moves):
     return sources
 
 
+def verify_publication(manifest, taxonomy, cards, moves):
+    staged = {materials.local(path): text for path, text in cards.items()}
+    sources = staged_sources(moves)
+    materials.verify(manifest, taxonomy, inventory=True, staged_cards=staged, staged_sources=sources)
+    index = materials.render_index(manifest, taxonomy)
+    materials.check_links(materials.local('materials/INDEX.md'), text=index, staged=staged.keys() | sources.keys())
+    return index
+
+
+def stage_cards(receipt, *, published, write=False):
+    require(receipt['cards'].keys() == receipt['cards_before'].keys() ==
+            receipt['prepared_cards'].keys() == receipt['status_positions'].keys(), 'Inconsistent receipt card inventory')
+    for path, expected in receipt['cards'].items():
+        card = materials.local(path)
+        actual = materials.digest(card) if card.is_file() else None
+        before = receipt['cards_before'][path]
+        completed = receipt.get('completed_cards', {}).get(path)
+        require(actual == expected or actual == before or (published and completed is not None and completed == actual),
+                'Prepared card changed: ' + path)
+        text = receipt['prepared_cards'][path]
+        require(text_hash(text) == expected, 'Prepared receipt text changed: ' + path)
+        if write and actual == before and actual != expected:
+            atomic_text(card, text)
+
+
+def legacy_card(receipt, path, actual, expected, published):
+    text = materials.local(path).read_bytes().decode('utf-8')
+    if published and actual == receipt.get('completed_cards', {}).get(path):
+        return text
+    header = any(entry['card'] == path for entry in receipt['entries'])
+    material_id = Path(path).stem
+    scans = sum(update['material_id'] == material_id for update in receipt['representations'])
+    status = PENDING if actual == expected else COMPLETED
+    # Legacy generated headers precede Sources; newly appended scan statuses
+    # are the last scan statuses, after any earlier accepted representations.
+    positions = []
+    if header:
+        positions += [m.end() - len(status) for m in re.finditer(
+            r'^- Статус: ' + re.escape(status) + r'(?=\r?$)', text.split('## Источники', 1)[0], re.M)][:1]
+    if scans:
+        positions += [m.end() - len(status) for m in re.finditer(
+            r'^Статус скана: ' + re.escape(status) + r'(?=\r?$)', text, re.M)][-scans:]
+    require(len(positions) == int(header) + scans, 'Missing legacy intake status: ' + path)
+    if actual != expected:
+        restored = text
+        for position in reversed(positions):
+            restored = restored[:position] + PENDING + restored[position + len(COMPLETED):]
+        # Older Windows preparation used CRLF and publication sometimes used LF.
+        require(expected in {text_hash(restored), text_hash(restored.replace('\r\n', '\n').replace('\n', '\r\n'))},
+                'Prepared card changed: ' + path)
+        return text
+    final = finish_card(text, positions)
+    if published and text_hash(final.replace('\r\n', '\n')) == receipt['completed_cards'][path]:
+        return final.replace('\r\n', '\n')
+    return final
+
+
 def accept(receipt_path):
     receipt = read(receipt_path)
     manifest_path = materials.local('materials/manifest.json')
     current_hash = materials.digest(manifest_path)
     published = current_hash == receipt.get('manifest_after_sha256')
     require(published or current_hash == receipt['manifest_before_sha256'], 'Manifest changed after preparation')
-    completed_cards = receipt.get('completed_cards', {})
-    final_texts = {}
-    for path, expected in receipt['cards'].items():
-        card = materials.local(path)
-        actual = materials.digest(card)
-        # Recover old receipts whose card status was changed before registry publication.
-        legacy_final = (actual != expected and COMPLETED.encode() in card.read_bytes() and
-                        hashlib.sha256(card.read_bytes().replace(COMPLETED.encode(), PENDING.encode())).hexdigest() == expected)
-        require(actual == expected or (published and actual == completed_cards.get(path)) or legacy_final,
-                'Prepared card changed: ' + path)
-        text = card.read_text(encoding='utf-8')
-        if legacy_final and not published:
-            text = text.replace(COMPLETED, PENDING)
-        final_texts[path] = text.replace(PENDING, COMPLETED)
+    if receipt['schema_version'] == 2:
+        stage_cards(receipt, published=published)
+        final_texts = {path: finish_card(text, receipt['status_positions'][path])
+                       for path, text in receipt['prepared_cards'].items()}
+    else:
+        require(receipt['schema_version'] == 1, 'Unknown intake receipt version')
+        final_texts = {path: legacy_card(receipt, path, materials.digest(materials.local(path)), expected, published)
+                       for path, expected in receipt['cards'].items()}
     check_moves(receipt['moves'], recover=True)
     manifest, taxonomy = materials.load()
     require(materials.digest(manifest_path) == current_hash, 'Manifest changed during acceptance')
     if not published:
         add_prepared_entries(manifest, receipt['entries'], receipt['representations'])
-    materials.verify(manifest, taxonomy, staged_sources=staged_sources(receipt['moves']))
-    index_text = materials.render_index(manifest, taxonomy)
+    registered = {entry['id']: entry['card'] for entry in manifest['materials']}
+    affected = {entry['card'] for entry in receipt['entries']} | {
+        registered[update['material_id']] for update in receipt['representations']}
+    require(affected == final_texts.keys(), 'Receipt includes unexpected or missing cards')
+    destinations = {source['path'] for entry in receipt['entries'] for source in
+                    (entry.get('originals') or [{'path': entry['original']}])}
+    destinations.update(update['representation']['path'] for update in receipt['representations'])
+    require(destinations == {move['destination'] for move in receipt['moves']}, 'Receipt archive paths differ from sources')
+    if published:
+        require(receipt['completed_cards'] == {path: text_hash(text) for path, text in final_texts.items()},
+                'Receipt does not match the published card checksums')
+    index_text = verify_publication(manifest, taxonomy, final_texts, receipt['moves'])
     for move in receipt['moves']:
         src, dst = materials.local(move['source']), materials.local(move['destination'])
         if src.exists():
@@ -317,15 +424,15 @@ def accept(receipt_path):
         require(materials.digest(dst) == move['sha256'], 'Archived source hash mismatch')
     if not published:
         receipt['manifest_after_sha256'] = hashlib.sha256(serialized(manifest).encode('utf-8')).hexdigest()
-        receipt['completed_cards'] = {path: hashlib.sha256(text.encode('utf-8')).hexdigest()
-                                      for path, text in final_texts.items()}
+        receipt['completed_cards'] = {path: text_hash(text) for path, text in final_texts.items()}
         save(receipt_path, receipt)
         require(materials.digest(manifest_path) == current_hash, 'Manifest changed during acceptance')
         save(manifest_path, manifest)
     # Only a published registry permits completed labels. Each write is replace-atomic.
     for path, text in final_texts.items():
-        if materials.digest(materials.local(path)) != receipt['completed_cards'][path]:
-            atomic_text(materials.local(path), text)
+        card = materials.local(path)
+        if not card.is_file() or materials.digest(card) != receipt['completed_cards'][path]:
+            atomic_text(card, text)
     index = materials.local('materials/INDEX.md')
     atomic_text(index, index_text)
     materials.verify(manifest, taxonomy, inventory=True)

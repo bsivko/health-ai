@@ -21,18 +21,27 @@ def read(path):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-def timeline(events):
-    """Replay effective dates; a visible correction replaces its checkpoint."""
-    superseded = {e['corrects_event_id'] for e in events
-                  if e['type'] == 'checkpoint' and e.get('corrects_event_id')}
-    return [event for _, event in sorted(
-        ((i, e) for i, e in enumerate(events) if e['id'] not in superseded),
-        key=lambda item: (item[1]['effective_date'], item[1]['recorded_date'], item[0]))]
+def timeline(events, as_of=None):
+    """Keep each correction in the time slot of the original checkpoint."""
+    slots, visible = {}, {}
+    for index, event in enumerate(events):
+        effective = date.fromisoformat(event['effective_date'])
+        recorded = date.fromisoformat(event['recorded_date'])
+        slot = slots.get(event.get('corrects_event_id')) if event['type'] == 'checkpoint' else None
+        if slot is None:
+            slot = (effective, recorded, index)
+        slots[event['id']] = slot
+        if as_of is None or (slot[0] <= as_of and recorded <= as_of):
+            previous = visible.get(slot)
+            if previous is None or (recorded, index) > previous[:2]:
+                visible[slot] = (recorded, index, dict(event, effective_date=slot[0].isoformat(),
+                                                     recorded_date=recorded.isoformat()))
+    return [visible[slot][2] for slot in sorted(visible)]
 
 
-def check_events(course, events):
+def check_events(course, events, *, new_event=False):
     ids = {}
-    for event in events:
+    for index, event in enumerate(events):
         ident = event['id']
         materials.require(ident not in ids, 'Duplicate event ID')
         materials.require(event['course_id'] == course['id'], 'Wrong course ID')
@@ -45,13 +54,18 @@ def check_events(course, events):
             value = event['reported_total_units']
             materials.require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
                               'Invalid cumulative unit count')
-            last_intake_date = event.get('last_intake_date')
-            if last_intake_date is not None:
-                materials.require(date.fromisoformat(last_intake_date) <= when, 'Future intake date')
             correction = event.get('corrects_event_id')
             if correction:
-                materials.require(correction in ids and ids[correction]['type'] == 'checkpoint',
+                materials.require(correction in ids and ids[correction][0] == 'checkpoint',
                                   'Correction must reference an earlier checkpoint')
+                _, corrected_date, corrected_recorded = ids[correction]
+                materials.require(recorded >= corrected_recorded, 'Correction recorded before its original')
+                if new_event and index == len(events) - 1:
+                    materials.require(when == corrected_date, 'Correction must retain the original checkpoint effective date')
+                when = corrected_date
+            last_intake_date = event.get('last_intake_date')
+            if last_intake_date is not None:
+                materials.require(date.fromisoformat(last_intake_date) <= when, 'Intake date is after the checkpoint it refers to')
             if event.get('expected_next'):
                 expected = event['expected_next']
                 materials.require(date.fromisoformat(expected['date']) > when and expected['ordinal'] == value + 1,
@@ -62,13 +76,13 @@ def check_events(course, events):
             materials.require(event['scheduled_units'] > 0, 'Invalid missed amount')
         else:
             materials.require(event['units_per_day'] > 0, 'Invalid reported regimen')
-        ids[ident] = event
+        ids[ident] = (event['type'], when, recorded)
     total = None
     for event in timeline(events):
         if event['type'] == 'checkpoint':
             value = event['reported_total_units']
-            materials.require(total is None or value >= total or event.get('corrects_event_id'),
-                              'Count decrease needs explicit correction')
+            materials.require(total is None or value >= total,
+                              'Cumulative counts decrease between checkpoints; resolve the conflicting reports')
             total = value
 
 
@@ -112,11 +126,11 @@ def load():
 
 
 def state(course, events, as_of):
-    date.fromisoformat(as_of)
-    visible = [e for e in events if e['effective_date'] <= as_of and e['recorded_date'] <= as_of]
+    cutoff = date.fromisoformat(as_of)
     status, dose, checkpoint = 'unknown', course['regimen']['units_per_day'], None
     changed = False
-    for event in timeline(visible):
+    regimen_changed_on = None
+    for event in timeline(events, cutoff):
         if status == 'unknown':
             status = course['initial_reported_status']
         if event['type'] == 'checkpoint':
@@ -127,8 +141,10 @@ def state(course, events, as_of):
         else:
             if event['type'] == 'regimen_change':
                 dose = event['units_per_day']
+                regimen_changed_on = event['effective_date']
             changed = True
-    out = dict(course_id=course['id'], as_of=as_of, status=status, units_per_day=dose,
+    out = dict(course_id=course['id'], as_of=cutoff.isoformat(), status=status, units_per_day=dose,
+               regimen_changed_on=regimen_changed_on,
                checkpoint=checkpoint, reported_total_units=None, remaining_units_at_checkpoint=None,
                projection=None)
     if checkpoint:
@@ -149,22 +165,29 @@ def state(course, events, as_of):
 
 def user_reports(as_of=None):
     manifest, _ = materials.load()
-    known = {e['id'] for e in manifest['materials']}
+    known = {e['id']: materials.local(e['card']) for e in manifest['materials']}
+    cutoff = date.fromisoformat(as_of) if as_of is not None else None
     reports = []
     for path in sorted(FOLDER.glob('REPORT-*.json')):
         report = read(path)
-        date.fromisoformat(report['recorded_date'])
+        recorded = date.fromisoformat(report['recorded_date'])
         materials.require(report['source']['kind'] == 'user_message' and bool(report['source']['quote']),
                           'Report needs a quoted user message')
-        key = 'prescription' if report.get('prescription_material_id') else 'product'
-        materials.require(report[key + '_material_id'] in known, 'Unknown report source')
-        materials.require(materials.local(report[key + '_card']).is_file(), 'Missing report source card')
-        if as_of is None or report['recorded_date'] <= as_of:
+        keys = [key for key in ('prescription', 'product')
+                if report.get(key + '_material_id') or report.get(key + '_card')]
+        materials.require(bool(keys), 'Report needs a material source')
+        for key in keys:
+            card = materials.local(report[key + '_card'])
+            materials.require(known.get(report[key + '_material_id']) == card, 'Report material ID/card mismatch')
+            materials.require(card.is_file(), 'Missing report source card')
+        if cutoff is None or recorded <= cutoff:
             reports.append((path, report))
     return reports
 
 
 def render(courses, as_of):
+    cutoff = date.fromisoformat(as_of)
+    as_of = cutoff.isoformat()
     lines = ['# Текущий учёт приёма', '', 'Снимок на **' + as_of + '**. Подтверждения и расчётные даты разделены. '
              'Количество принято́го меняется только по сообщению пользователя, не с ходом времени.', '']
     for course, events in courses:
@@ -181,10 +204,8 @@ def render(courses, as_of):
                       ' ед.**. Это пользовательский учёт, не назначение врача.']
         else:
             lines += ['- Приём без сообщённой даты окончания; срок и итоговое количество не заданы.']
-        starts = [event for event in events if event['type'] == 'status_change'
-                  and event['status'] == 'active' and event['effective_date'] <= as_of
-                  and event['recorded_date'] <= as_of]
-        starts.sort(key=lambda event: (event['effective_date'], event['recorded_date']))
+        starts = [event for event in timeline(events, cutoff)
+                  if event['type'] == 'status_change' and event['status'] == 'active']
         if course.get('planned_start_date'):
             if starts:
                 lines += ['- Начало приёма подтверждено сообщением пользователя: **' +
@@ -195,8 +216,9 @@ def render(courses, as_of):
             lines += ['- Условное окончание при старте по плану и без перерывов: **' + course['planned_end_date'] + '**; календарь не подтверждает приём и завершение.']
         if course.get('prescription_card'):
             lines += ['- [Назначение врача](../../' + course['prescription_card'] + '); схема упаковки и схема приёма сопоставлены отдельно.']
-        if course.get('current_regimen_start_date'):
-            lines += ['- Текущая схема с **' + course['current_regimen_start_date'] +
+        regimen_date = current['regimen_changed_on'] or course.get('current_regimen_start_date')
+        if regimen_date:
+            lines += ['- Текущая схема с **' + regimen_date +
                       '** по подтверждению пользователя; ежедневные приёмы за этот период не перечислялись.']
         for prior in course.get('reported_prior_regimens', []):
             lines += ['- Предшествующая схема: ' + str(prior['units_per_day']) + ' ' +
@@ -205,14 +227,15 @@ def render(courses, as_of):
             lines += ['- По сообщению пользователя до указанной даты приёма не было.']
         if course.get('reported_start_period'):
             lines += ['- Начало по сообщению пользователя: **' + course['reported_start_period'] + '**; точная дата неизвестна.']
-        if course.get('daily_dose_description'):
-            lines += ['- Доза по текущей схеме: ' + course['daily_dose_description'] + '.']
-        timing = [course['regimen'].get('time_of_day'), course['regimen'].get('relation_to_meals')]
-        if any(timing):
-            lines += ['- Время по сообщению пользователя: ' + '; '.join(v for v in timing if v) + '.']
+        if not current['regimen_changed_on']:
+            if course.get('daily_dose_description'):
+                lines += ['- Доза по текущей схеме: ' + course['daily_dose_description'] + '.']
+            timing = [course['regimen'].get('time_of_day'), course['regimen'].get('relation_to_meals')]
+            if any(timing):
+                lines += ['- Время по сообщению пользователя: ' + '; '.join(v for v in timing if v) + '.']
         if course.get('reported_history'):
             lines += ['- История со слов пользователя: ' + course['reported_history'] + '.']
-        if course.get('prescription_timing_difference'):
+        if not current['regimen_changed_on'] and course.get('prescription_timing_difference'):
             lines += ['- Различие источников: ' + course['prescription_timing_difference']]
         if course.get('history_file'):
             lines += ['- [Исторические записи и происхождение](' + Path(course['history_file']).name + ').']
@@ -269,22 +292,23 @@ def main():
         user_reports()
         print('OK: course definitions, product sources and event histories verified.')
     elif args.command == 'status':
-        date.fromisoformat(args.as_of)
-        rows = [state(c, e, args.as_of) for c, e in courses]
+        as_of = date.fromisoformat(args.as_of).isoformat()
+        rows = [state(c, e, as_of) for c, e in courses]
         if not args.courses_only:
-            rows.extend(dict(kind='user_report', as_of=args.as_of,
+            rows.extend(dict(kind='user_report', as_of=as_of,
                              path=path.relative_to(materials.ROOT).as_posix(), report=report)
                         for path, report in user_reports(args.as_of))
         print(json.dumps(rows, ensure_ascii=False, indent=2))
     elif args.command == 'render':
         output = FOLDER / 'CURRENT.md'
-        output.write_text(render(courses, args.as_of), encoding='utf-8')
-        materials.check_links(output)
+        text = render(courses, args.as_of)
+        materials.check_links(output, text=text)
+        output.write_text(text, encoding='utf-8')
         print('OK: current view rebuilt from reported events; expected doses not confirmed.')
     else:
         course, events = next((c, e) for c, e in courses if c['id'] == args.course_id)
         event = read(materials.local(args.event_json))
-        check_events(course, events + [event])
+        check_events(course, events + [event], new_event=True)
         path = materials.local(course['events_file'])
         # Recheck the full history immediately before append; never rewrite it.
         current = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]

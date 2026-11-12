@@ -12,12 +12,14 @@ from datetime import date, datetime, time, timedelta
 import json
 import operator
 from pathlib import Path
+import posixpath
 import re
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
 
 import openpyxl
+from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils.datetime import from_excel, to_excel
 
@@ -31,6 +33,10 @@ def serializable(value):
         return {'seconds': value.total_seconds()}
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, ArrayFormula):
+        return {'kind': 'array', 'text': value.text, 'attributes': dict(value)}
+    if isinstance(value, DataTableFormula):
+        return {'kind': 'data_table', 'attributes': dict(value)}
     return str(value)
 
 
@@ -59,6 +65,56 @@ def arithmetic(formula, reference):
     return visit(tree)
 
 
+def part_path(owner, target):
+    path = posixpath.normpath(target.lstrip('/') if target.startswith('/') else
+                             posixpath.join(posixpath.dirname(owner), target))
+    materials.require(path != '..' and not path.startswith('../'), 'Invalid OOXML part target')
+    return path
+
+
+def worksheet_parts(archive, ns):
+    root_rels = ET.fromstring(archive.read('_rels/.rels'))
+    workbook_rel = next(rel for rel in root_rels if rel.get('Type', '').endswith('/officeDocument'))
+    workbook = part_path('', workbook_rel.attrib['Target'])
+    folder, name = posixpath.split(workbook)
+    rel_file = posixpath.join(folder, '_rels', name + '.rels')
+    relationships = {r.attrib['Id']: r for r in ET.fromstring(archive.read(rel_file))}
+    mapping = {}
+    for node in ET.fromstring(archive.read(workbook)).findall('s:sheets/s:sheet', ns):
+        relation = relationships[node.attrib['{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id']]
+        if relation.attrib['Type'].endswith('/worksheet'):
+            materials.require(relation.get('TargetMode') != 'External', 'External worksheet part')
+            mapping[node.attrib['name']] = part_path(workbook, relation.attrib['Target'])
+    return mapping
+
+
+def source_cells(archive, name, ns):
+    rows = ET.fromstring(archive.read(name)).findall('s:sheetData/s:row', ns)
+    result = {}
+    row_number = 0
+    for row in rows:
+        row_number = int(row.get('r', row_number + 1))
+        column = 0
+        for cell in row.findall('s:c', ns):
+            address = cell.get('r')
+            if address is None:
+                column += 1
+                address = openpyxl.utils.get_column_letter(column) + str(row_number)
+            else:
+                column = openpyxl.utils.cell.coordinate_from_string(address)[0]
+                column = openpyxl.utils.column_index_from_string(column)
+            formula = cell.find('s:f', ns)
+            inline = cell.find('s:is', ns)
+            result[address] = {
+                'type': cell.get('t'), 'style': cell.get('s'),
+                'v': cell.findtext('s:v', namespaces=ns),
+                'formula': formula.text if formula is not None else None,
+                'formula_attributes': dict(formula.attrib) if formula is not None else None,
+                'inline_string_xml': ET.tostring(inline, encoding='unicode') if inline is not None else None,
+            }
+    return result
+
+
 def extract(source, output):
     materials.require(output.is_dir() and (output / 'AGENTS.md').exists(), 'Read/create output AGENTS first')
     materials.require(not (output / 'workbook.json').exists(), 'Refusing to overwrite extraction')
@@ -66,24 +122,10 @@ def extract(source, output):
     wb = openpyxl.load_workbook(source, data_only=False, read_only=False)
     cached = openpyxl.load_workbook(source, data_only=True, read_only=False)
     ns = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-    raw_sheets = {}
     with zipfile.ZipFile(source) as archive:
-        for name in archive.namelist():
-            if re.fullmatch(r'xl/worksheets/sheet\d+\.xml', name):
-                raw_sheets[name] = {cell.attrib['r']: {
-                    'type': cell.get('t'), 'style': cell.get('s'),
-                    'v': cell.findtext('s:v', namespaces=ns),
-                    'formula': cell.findtext('s:f', namespaces=ns),
-                    'formula_attributes': dict(cell.find('s:f', ns).attrib) if cell.find('s:f', ns) is not None else None,
-                } for cell in ET.fromstring(archive.read(name)).findall('.//s:sheetData/s:row/s:c', ns)}
+        mapping = worksheet_parts(archive, ns)
+        raw_sheets = {name: source_cells(archive, part, ns) for name, part in mapping.items()}
         package_parts = [{'path': i.filename, 'size': i.file_size, 'crc': i.CRC} for i in archive.infolist()]
-        # Resolve names to worksheet XML using the actual workbook relationships.
-        relns = {'r': 'http://schemas.openxmlformats.org/package/2006/relationships'}
-        rels = {r.attrib['Id']: r.attrib['Target'] for r in ET.fromstring(archive.read('xl/_rels/workbook.xml.rels'))}
-        mapping = {}
-        for node in ET.fromstring(archive.read('xl/workbook.xml')).findall('s:sheets/s:sheet', ns):
-            target = rels[node.attrib['{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id']]
-            mapping[node.attrib['name']] = target.lstrip('/') if target.startswith('/') else 'xl/' + target
     summary = dict(schema_version=1, source_sha256=source_hash,
                    source_received_name=source.name, epoch=wb.epoch.isoformat(),
                    created=serializable(wb.properties.created), modified=serializable(wb.properties.modified),
@@ -91,7 +133,9 @@ def extract(source, output):
                    formula_policy='Preserve source/cached values; independently evaluate only simple same-sheet arithmetic, never modify workbook')
     verification = []
     for index, sheet in enumerate(wb.worksheets, 1):
-        raw = raw_sheets.get(mapping[sheet.title], {})
+        raw = raw_sheets[sheet.title]
+        populated = {address for address, record in raw.items() if
+                     any(record[key] is not None for key in ('v', 'formula_attributes', 'inline_string_xml'))}
         cells = []
         resolved = {}
         active = set()
@@ -106,6 +150,8 @@ def extract(source, output):
                 cell = sheet[address]
                 value = cell.value
                 if cell.data_type == 'f':
+                    if not isinstance(value, str):
+                        raise ValueError('Unsupported non-scalar formula')
                     value = arithmetic(value.replace('$', ''), number)
                 elif isinstance(value, (datetime, date, time, timedelta)):
                     value = to_excel(value, wb.epoch)
@@ -118,7 +164,7 @@ def extract(source, output):
 
         for row in sheet:
             for cell in row:
-                if cell.value is None and cell.comment is None and cell.hyperlink is None:
+                if cell.value is None and cell.comment is None and cell.hyperlink is None and cell.coordinate not in populated:
                     continue
                 record = dict(address=cell.coordinate, row=cell.row, column=cell.column,
                               value=serializable(cell.value), data_type=cell.data_type,
@@ -154,17 +200,16 @@ def extract(source, output):
                 value = cell.get('derived_value', cell['value'])
                 display = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
                 if cell['data_type'] == 'f':
-                    display += ' [формула ' + cell['value'] + '; ' + cell['derivation_status'] + ']'
+                    display += ' [формула ' + str(cell['value']) + '; ' + cell['derivation_status'] + ']'
                 parts.append(cell['address'] + ': ' + display.replace('|', '\\|').replace('\n', '<br>'))
             lines.append('| ' + str(row_number) + ' | ' + '<br>'.join(parts) + ' |')
         if not cells:
             lines.append('| — | Нет непустых ячеек; возможные графические объекты остаются в XLSX |')
         (output / (filename + '.md')).write_text('\n'.join(lines) + '\n', encoding='utf-8')
-        count_xml = sum(1 for a, r in raw.items() if r['v'] is not None or r['formula'] is not None or sheet[a].value is not None)
-        missing = [a for a, r in raw.items() if (r['v'] is not None or r['formula'] is not None) and a not in {c['address'] for c in cells}]
+        missing = sorted(populated - {c['address'] for c in cells})
         materials.require(not missing, 'Source cells missing from extraction')
         info = dict(order=index, name=sheet.title, json=filename + '.json', markdown=filename + '.md',
-                    populated_cells=len(cells), source_value_or_formula_cells=count_xml,
+                    populated_cells=len(cells), source_value_or_formula_cells=len(populated),
                     formulas=sum(c['data_type'] == 'f' for c in cells),
                     unresolved_formulas=[c['address'] for c in cells if c.get('derivation_status') == 'unresolved'])
         summary['sheets'].append(info)

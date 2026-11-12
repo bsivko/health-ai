@@ -1,4 +1,4 @@
 # Optional extractors and chart/image helpers. Core intake/checks use stdlib.
 # Install only the packages needed for your sources; no model/OCR is installed.
 Pillow
-openpyxl
+openpyxl>=3.1
